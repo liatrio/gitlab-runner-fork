@@ -15,6 +15,8 @@ import (
 	"time"
 
 	"github.com/sirupsen/logrus"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/trace"
 
 	"gitlab.com/gitlab-org/gitlab-runner/helpers"
 	"gitlab.com/gitlab-org/gitlab-runner/helpers/dns"
@@ -150,6 +152,8 @@ type Build struct {
 	secretsResolver func(l logger, registry SecretResolverRegistry, featureFlagOn func(string) bool) (SecretsResolver, error)
 
 	Session *session.Session
+
+	Span *trace.Span
 
 	logger BuildLogger
 
@@ -884,10 +888,19 @@ func (b *Build) Run(globalConfig *Config, trace JobTrace) (err error) {
 
 	b.expandContainerOptions()
 
-	ctx, cancel := context.WithTimeout(context.Background(), b.GetBuildTimeout())
+	// TODO: Add Top-level trace id here?
+	// TODO: This should really be in trace.go
+	tracer := otel.GetTracerProvider().Tracer("gitlab")
+	spanName := fmt.Sprintf("%s-%s-%s", b.JobInfo.ProjectName, b.JobInfo.Name, b.JobInfo.Stage)
+
+	ctx, span := tracer.Start(context.Background(), spanName)
+	ctx, cancel := context.WithTimeout(ctx, b.GetBuildTimeout())
+	// TODO defer span end, incorporate cancel()
+	defer span.End()
 	defer cancel()
 
 	b.configureTrace(trace, cancel)
+	b.Span = &span // This should probably be inside the b.Trace instead
 
 	options := b.createExecutorPrepareOptions(ctx, globalConfig, trace)
 	provider := GetExecutorProvider(b.Runner.Executor)
@@ -1057,6 +1070,20 @@ func (b *Build) GetDefaultVariables() JobVariables {
 	}
 }
 
+func (b *Build) GetTracingVariables() JobVariables {
+	span := *b.Span
+
+	return JobVariables{
+		{
+			Key:      "TRACEPARENT",
+			Value:    span.SpanContext().TraceID().String(),
+			Public:   true,
+			Internal: false,
+			File:     false,
+		},
+	}
+}
+
 func (b *Build) GetDefaultFeatureFlagsVariables() JobVariables {
 	variables := make(JobVariables, 0)
 	for _, featureFlag := range featureflags.GetAll() {
@@ -1150,6 +1177,7 @@ func (b *Build) GetAllVariables() JobVariables {
 	variables = append(variables, b.GetCITLSVariables()...)
 	variables = append(variables, b.Variables...)
 	variables = append(variables, b.GetSharedEnvVariable())
+	variables = append(variables, b.GetTracingVariables()...)
 	variables = append(variables, AppVersion.Variables()...)
 	variables = append(variables, b.secretsVariables...)
 
